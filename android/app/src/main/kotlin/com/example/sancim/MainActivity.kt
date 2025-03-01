@@ -1,4 +1,4 @@
-package com.example.sancim_app
+package com.example.sancim
 
 import io.flutter.embedding.android.FlutterActivity
 

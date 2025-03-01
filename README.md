@@ -1,6 +1,6 @@
-# sancim_app
+# sancim
 
-A mobile app for SANCIM
+A new Flutter project.
 
 ## Getting Started
 

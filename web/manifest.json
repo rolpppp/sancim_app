@@ -1,11 +1,11 @@
 {
-    "name": "sancim_app",
-    "short_name": "sancim_app",
+    "name": "sancim",
+    "short_name": "sancim",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
     "theme_color": "#0175C2",
-    "description": "A mobile app for SANCIM",
+    "description": "A new Flutter project.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [
