@@ -1,16 +1,17 @@
-# sancim
+# SANCIM App
 
-A new Flutter project.
+This is a mobile app for the Smart Assistive Navigation Cane with Integrated Mobile Monitoring for Visually Impaired 
+Individual (SANCIM) project. This current version allows users to:
 
-## Getting Started
+1.) **Stream as Server** - serves as the exteral device attached to the cane. This will be connected to the sensor
+via bluetooth module (will be implemented in the next update).
+2.) **Connect as Client** - serves as the monitoring device which receives images and notifcations from the server 
+device.
 
-This project is a starting point for a Flutter application.
+# How to Use SANCIM app
 
-A few resources to get you started if this is your first Flutter project:
-
-- [Lab: Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
-- [Cookbook: Useful Flutter samples](https://docs.flutter.dev/cookbook)
-
-For help getting started with Flutter development, view the
-[online documentation](https://docs.flutter.dev/), which offers tutorials,
-samples, guidance on mobile development, and a full API reference.
+1.) Open the app and allows all required permissions.
+2.) Tap 'Stream as Server' and note the IP address.
+3.) For the other device (for monitoring), tap 'Connect as Client' and fill out the
+needed information.
+4.) Enjoy!
