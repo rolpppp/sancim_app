@@ -11,6 +11,8 @@ import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:flutter/services.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:flutter_map/flutter_map.dart';
+import 'package:latlong2/latlong.dart'; // For LatLng coordinates
 
 // Constants for optimization
 const int TARGET_WIDTH = 256;
@@ -234,6 +236,10 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   void startServer() async {
+    int retryCount = 0;
+    const int maxRetries = 5;
+    const int basePort = 8080;
+
     try {
       setState(() {
         isServer = true;
@@ -245,8 +251,24 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       ipAddress = wifiIP ?? "192.168.43.1"; // Default hotspot IP
 
       // Start WebSocket server
-      server = await HttpServer.bind(InternetAddress.anyIPv4, port);
-      print('Server started at $ipAddress:$port');
+      while (retryCount < maxRetries){
+        try {
+          server = await HttpServer.bind(InternetAddress.anyIPv4, basePort + retryCount);
+          port = basePort + retryCount; // Update the port variable
+          print('Server started at $ipAddress:$port');
+          break; // Exit the loop if binding succeeds
+        } on SocketException catch (e) {
+          retryCount++;
+          if (retryCount >= maxRetries) {
+            print('Failed to start server after $maxRetries attempts: $e');
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('Failed to start server: $e')),
+            );
+            return;
+          }
+          print('Port ${basePort + retryCount - 1} in use, retrying with port ${basePort + retryCount}');
+        }
+      }
 
       // Reset statistics
       framesSent = 0;
@@ -585,6 +607,24 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           imgLib.setPixelRgb(x, y, r, g, b);
         }
       }
+      final int sensorOrientation = widget.cameras[0].sensorOrientation;
+      img.Image rotatedImage;
+      switch (sensorOrientation) {
+        case 90:
+          rotatedImage = img.copyRotate(imgLib, angle: 90);
+          break;
+        case 180:
+          rotatedImage = img.copyRotate(imgLib, angle: 180);
+          break;
+        case 270:
+          rotatedImage = img.copyRotate(imgLib, angle: 270);
+          break;
+        default:
+          rotatedImage = imgLib; // No rotation needed
+      }
+
+      // Resize the image to fixed dimensions
+      final img.Image resizedImage = img.copyResize(rotatedImage, width: 320, height: 240);
 
       // Encode with reduced quality for better transmission speed
       final List<int> jpegBytes = img.encodeJpg(imgLib, quality: quality);
@@ -838,6 +878,9 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  // Map Controller for interactivity
+  final MapController _mapController = MapController();
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -872,58 +915,111 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         ),
         body: Stack(
             children: [
-        // Main content
-        Center(
-        child: isServer
-        ? (isCameraInitialized
-        ? CameraPreview(cameraController!)
-            : CircularProgressIndicator())
-        : (isConnected
-    ? (receivedImageData != null
-    ? Image.memory(
-    receivedImageData!,
-    gaplessPlayback: true, // Prevent flickering
-    key: ValueKey(framesReceived), // Force refresh
-    )
-        : Column(
-    mainAxisAlignment: MainAxisAlignment.center,
-    children: [
-    CircularProgressIndicator(),
-    SizedBox(height: 10),
-    Text('Waiting for stream...'),
-    ],
-    ))
-        : Column(
-    mainAxisAlignment: MainAxisAlignment.center,
-    children: [
-    Text('Not connected', style: TextStyle(fontSize: 18)),
-    SizedBox(height: 20),
-    ElevatedButton(
-    onPressed: startServer,
-    child: Row(
-    mainAxisSize: MainAxisSize.min,
-    children: [
-    Icon(Icons.wifi_tethering),
-    SizedBox(width: 8),
-    Text('Start as Server'),
-    ],
-    ),
-    ),
-      SizedBox(height: 10),
-      ElevatedButton(
-        onPressed: connectToServer,
-        child: Row(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.connect_without_contact),
-            SizedBox(width: 8),
-            Text('Connect to Server'),
-          ],
-        ),
-      ),
-    ],
-        )),
-        ),
+              // Main content
+              Center(
+                child: isServer
+                  ? (isCameraInitialized
+                    ? CameraPreview(cameraController!)
+                    : CircularProgressIndicator())
+                  : (isConnected
+                    ? (receivedImageData != null
+                      ? Image.memory(
+                        receivedImageData!,
+                        gaplessPlayback: true, // Prevent flickering
+                        key: ValueKey(framesReceived), // Force refresh
+                        )
+                      : Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          CircularProgressIndicator(),
+                          SizedBox(height: 10),
+                          Text('Waiting for stream...'),
+                        ],
+                      ))
+                 : Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Text('Not connected', style: TextStyle(fontSize: 18)),
+                      SizedBox(height: 20),
+                      ElevatedButton(
+                        onPressed: startServer,
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.wifi_tethering),
+                            SizedBox(width: 8),
+                            Text('Start as Server'),
+                          ],
+                        ),
+                      ),
+                      SizedBox(height: 10),
+                      ElevatedButton(
+                        onPressed: connectToServer,
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.connect_without_contact),
+                            SizedBox(width: 8),
+                            Text('Connect to Server'),
+                          ],
+                        ),
+                      ),
+                    ],
+                )),
+              ),
+
+              // Map overlay
+              if (!isServer && isConnected && remoteLocation != null)
+                Positioned(
+                  left: 10,
+                  top: 50,
+                  right: 10,
+                  child: Container(
+                      height: 250, // Fixed height for the map
+                      decoration: BoxDecoration(
+                        color: Colors.black.withOpacity(0.6),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: ClipRRect(
+                        borderRadius: BorderRadius.circular(10),
+                        child: FlutterMap(
+                            mapController: _mapController,
+                            options: MapOptions(
+                              center: LatLng(
+                                remoteLocation!.latitude!,
+                                remoteLocation!.longitude!,
+                              ),
+                              zoom: 15.0, // Initial zoom level
+                            ),
+                              children: [
+                              // OpenStreetMap tiles
+                                TileLayer(
+                                urlTemplate: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+                                subdomains: ['a', 'b', 'c'],
+                              ),
+                                // Marker for the server's location
+                                MarkerLayer(
+                                  markers: [
+                                    Marker(
+                                      width: 40.0,
+                                      height: 40.0,
+                                        point: LatLng(
+                                          remoteLocation!.latitude!,
+                                          remoteLocation!.longitude!,
+                                        ),
+                                      builder: (ctx) => Icon(
+                                        Icons.location_pin,
+                                        color: Colors.red,
+                                        size: 40.0,
+                                      ),
+                                     ),
+                                ],
+                              ),
+                              ],
+                        ),
+                      ),
+                  ),
+                ),
 
               // Connection quality indicator overlay
               if (isConnected)
@@ -964,7 +1060,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                   bottom: 90,
                   child: Container(
                     padding: EdgeInsets.all(8),
-                    width: MediaQuery.of(context).size.width * 0.9,
+                    width: MediaQuery.of(context).size.width - 10,
                     decoration: BoxDecoration(
                       color: Colors.black.withOpacity(0.6),
                       borderRadius: BorderRadius.circular(10),
