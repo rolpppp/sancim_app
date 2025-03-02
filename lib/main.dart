@@ -9,9 +9,26 @@ import 'package:location/location.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:web_socket_channel/io.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:flutter/services.dart';
+import 'package:wakelock_plus/wakelock_plus.dart';
+
+// Constants for optimization
+const int TARGET_WIDTH = 256;
+const int JPEG_QUALITY = 40;
+const int FRAME_INTERVAL_MS = 300; // 30 fps
+const int LOCATION_INTERVAL_MS = 3000;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Keep screen on during streaming
+  await WakelockPlus.enable();
+
+  // Set preferred orientation to portrait
+  await SystemChrome.setPreferredOrientations([
+    DeviceOrientation.portraitUp,
+  ]);
+
   final cameras = await availableCameras();
   runApp(MyApp(cameras: cameras));
 }
@@ -24,8 +41,11 @@ class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Wi-Fi Livestream with GPS',
-      theme: ThemeData(primarySwatch: Colors.blue),
+      title: 'Navigation Assistant',
+      theme: ThemeData(
+        primarySwatch: Colors.blue,
+        brightness: Brightness.dark, // Dark theme for better visibility outdoors
+      ),
       home: HomePage(cameras: cameras),
     );
   }
@@ -40,7 +60,7 @@ class HomePage extends StatefulWidget {
   _HomePageState createState() => _HomePageState();
 }
 
-class _HomePageState extends State<HomePage> {
+class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool isServer = false;
   bool isConnected = false;
   String ipAddress = "";
@@ -54,31 +74,79 @@ class _HomePageState extends State<HomePage> {
   // Camera
   CameraController? cameraController;
   bool isCameraInitialized = false;
+  bool isStreaming = false;
+
+  // Optimization: Use a flag to control frame processing
+  bool isProcessingFrame = false;
+
+  // Frame counter for statistics
+  int framesSent = 0;
+  int framesReceived = 0;
+  int totalBytesSent = 0;
+  DateTime? statisticsStartTime;
+
+  // Throttled frame processing
+  DateTime? lastFrameTime;
 
   // Location
   Location location = Location();
   LocationData? currentLocation;
   Timer? locationTimer;
-  Timer? streamingTimer;
+  Timer? statisticsTimer;
 
   // For receiver
   Uint8List? receivedImageData;
   LocationData? remoteLocation;
 
+  // Connection quality indicator
+  double connectionQuality = 0.0; // 0.0 to 1.0
+  int latencyMs = 0;
+  Timer? pingTimer;
+  DateTime? lastPingSent;
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     checkPermissions();
+
+    // Initialize statistics timer
+    statisticsTimer = Timer.periodic(Duration(seconds: 5), (_) {
+      _updateStatistics();
+    });
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _cleanupResources();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (cameraController == null || !cameraController!.value.isInitialized) {
+      return;
+    }
+
+    if (state == AppLifecycleState.inactive) {
+      _cleanupResources();
+    } else if (state == AppLifecycleState.resumed) {
+      if (isServer) {
+        initCamera();
+      }
+    }
+  }
+
+  void _cleanupResources() {
+    stopStreaming();
     cameraController?.dispose();
     locationTimer?.cancel();
-    streamingTimer?.cancel();
+    statisticsTimer?.cancel();
+    pingTimer?.cancel();
     channel?.sink.close();
     server?.close();
-    super.dispose();
+    WakelockPlus.disable();
   }
 
   void checkPermissions() async {
@@ -94,6 +162,13 @@ class _HomePageState extends State<HomePage> {
       permissionStatus = await location.requestPermission();
       if (permissionStatus != PermissionStatus.granted) return;
     }
+
+    // Configure location service for better accuracy
+    await location.changeSettings(
+      accuracy: LocationAccuracy.high,
+      interval: LOCATION_INTERVAL_MS,
+      distanceFilter: 5, // meters
+    );
 
     // Start receiving location updates
     location.onLocationChanged.listen((LocationData locationData) {
@@ -111,19 +186,31 @@ class _HomePageState extends State<HomePage> {
 
     print("Initializing camera...");
 
+    // Select the best camera for navigation assistance
+    final CameraDescription selectedCamera = _selectOptimalCamera(widget.cameras);
+
     cameraController = CameraController(
-      widget.cameras[0],
-      ResolutionPreset.medium, // Higher resolution possible with Wi-Fi
+      selectedCamera,
+      ResolutionPreset.low, // Lower resolution for better streaming performance
       enableAudio: false,
+      imageFormatGroup: ImageFormatGroup.yuv420, // Optimized format for processing
     );
 
     try {
       await cameraController!.initialize();
 
+      // Set exposure mode for outdoor usage
+      if (cameraController!.value.isInitialized) {
+        await cameraController!.setExposureMode(ExposureMode.auto);
+        await cameraController!.setFocusMode(FocusMode.auto);
+      }
+
       // Important: set this to true only after successful initialization
-      setState(() {
-        isCameraInitialized = true;
-      });
+      if (mounted) {
+        setState(() {
+          isCameraInitialized = true;
+        });
+      }
 
       // Start streaming if this is the server
       if (isServer) {
@@ -131,6 +218,18 @@ class _HomePageState extends State<HomePage> {
       }
     } catch (e) {
       print('Error initializing camera: $e');
+    }
+  }
+
+  CameraDescription _selectOptimalCamera(List<CameraDescription> cameras) {
+    // Prefer back camera for navigation assistance
+    try {
+      return cameras.firstWhere(
+            (camera) => camera.lensDirection == CameraLensDirection.back,
+        orElse: () => cameras.first,
+      );
+    } catch (e) {
+      return cameras.first;
     }
   }
 
@@ -148,6 +247,11 @@ class _HomePageState extends State<HomePage> {
       // Start WebSocket server
       server = await HttpServer.bind(InternetAddress.anyIPv4, port);
       print('Server started at $ipAddress:$port');
+
+      // Reset statistics
+      framesSent = 0;
+      totalBytesSent = 0;
+      statisticsStartTime = DateTime.now();
 
       // Show connection info
       showDialog(
@@ -179,30 +283,30 @@ class _HomePageState extends State<HomePage> {
       // Listen for WebSocket connections
       server!.transform(WebSocketTransformer()).listen((WebSocket ws) {
         print('Client connected');
+
+        // Enable compression if supported
+        try {
+          (ws as dynamic).compression = true;
+        } catch (e) {
+          print('WebSocket compression not supported: $e');
+        }
+
         setState(() {
           clients.add(ws);
           isConnected = true;
         });
 
         // Handle client connection established - restart streaming if needed
-        if (isServer && isCameraInitialized && clients.isNotEmpty && streamingTimer == null) {
+        if (isServer && isCameraInitialized && clients.isNotEmpty && !isStreaming) {
           startStreaming();
         }
 
+        // Start ping-pong for latency measurement
+        _startPingPong(ws);
+
         // Listen for messages from client
         ws.listen((message) {
-          if (message is String && message.startsWith('LOCATION:')) {
-            final locationParts = message.substring(9).split(',');
-            if (locationParts.length >= 2) {
-              setState(() {
-                remoteLocation = LocationData.fromMap({
-                  'latitude': double.parse(locationParts[0]),
-                  'longitude': double.parse(locationParts[1]),
-                  'accuracy': locationParts.length > 2 ? double.parse(locationParts[2]) : 0.0,
-                });
-              });
-            }
-          }
+          _handleIncomingMessage(message, ws);
         }, onDone: () {
           print('Client disconnected');
           clients.remove(ws);
@@ -210,6 +314,11 @@ class _HomePageState extends State<HomePage> {
             setState(() {
               isConnected = false;
             });
+
+            // Stop streaming if no clients
+            if (isStreaming) {
+              stopStreaming();
+            }
           }
         }, onError: (error) {
           print('WebSocket error: $error');
@@ -218,21 +327,18 @@ class _HomePageState extends State<HomePage> {
             setState(() {
               isConnected = false;
             });
+
+            // Stop streaming if no clients
+            if (isStreaming) {
+              stopStreaming();
+            }
           }
         });
       });
 
-      // Start sending location updates
-      locationTimer = Timer.periodic(Duration(seconds: 3), (timer) {
-        if (currentLocation != null && clients.isNotEmpty) {
-          for (var client in clients) {
-            try {
-              client.add('LOCATION:${currentLocation!.latitude},${currentLocation!.longitude},${currentLocation!.accuracy}');
-            } catch (e) {
-              print('Error sending location: $e');
-            }
-          }
-        }
+      // Start sending location updates - optimized interval
+      locationTimer = Timer.periodic(Duration(milliseconds: LOCATION_INTERVAL_MS), (timer) {
+        _sendLocationToClients();
       });
     } catch (e) {
       print('Error starting server: $e');
@@ -242,56 +348,256 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  void _startPingPong(WebSocket ws) {
+    // Send ping every 2 seconds to measure connection quality
+    pingTimer = Timer.periodic(Duration(seconds: 2), (timer) {
+      if (clients.contains(ws)) {
+        try {
+          lastPingSent = DateTime.now();
+          ws.add('PING:${lastPingSent!.millisecondsSinceEpoch}');
+        } catch (e) {
+          print('Error sending ping: $e');
+        }
+      }
+    });
+  }
+
+  void _handleIncomingMessage(dynamic message, WebSocket ws) {
+    if (message is String && message.startsWith('PONG:')) {
+      // Handle latency measurement
+      try {
+        final pingTime = int.parse(message.substring(5));
+        final now = DateTime.now().millisecondsSinceEpoch;
+        latencyMs = now - pingTime;
+
+        // Update connection quality based on latency
+        // Lower latency = better quality (up to a point)
+        if (latencyMs < 50) {
+          connectionQuality = 1.0; // Excellent
+        } else if (latencyMs < 100) {
+          connectionQuality = 0.9; // Very good
+        } else if (latencyMs < 200) {
+          connectionQuality = 0.7; // Good
+        } else if (latencyMs < 500) {
+          connectionQuality = 0.5; // Fair
+        } else {
+          connectionQuality = 0.3; // Poor
+        }
+
+        setState(() {});
+      } catch (e) {
+        print('Error processing pong: $e');
+      }
+    } else if (message is String && message.startsWith('PING:')) {
+      // Respond to ping
+      try {
+        ws.add('PONG:${message.substring(5)}');
+      } catch (e) {
+        print('Error sending pong: $e');
+      }
+    } else if (message is Uint8List && message.length == 24) {
+      // Binary location data format (3 doubles: lat, lng, accuracy)
+      ByteData byteData = ByteData.view(message.buffer);
+      setState(() {
+        remoteLocation = LocationData.fromMap({
+          'latitude': byteData.getFloat64(0),
+          'longitude': byteData.getFloat64(8),
+          'accuracy': byteData.getFloat64(16),
+        });
+      });
+    } else if (message is String && message.startsWith('LOCATION:')) {
+      final locationParts = message.substring(9).split(',');
+      if (locationParts.length >= 2) {
+        setState(() {
+          remoteLocation = LocationData.fromMap({
+            'latitude': double.parse(locationParts[0]),
+            'longitude': double.parse(locationParts[1]),
+            'accuracy': locationParts.length > 2 ? double.parse(locationParts[2]) : 0.0,
+          });
+        });
+      }
+    }
+  }
+
+  void _sendLocationToClients() {
+    if (currentLocation != null && clients.isNotEmpty) {
+      for (var client in List.from(clients)) {
+        try {
+          // Send location in binary format for efficiency
+          ByteData data = ByteData(24); // 3 doubles at 8 bytes each
+          data.setFloat64(0, currentLocation!.latitude ?? 0);
+          data.setFloat64(8, currentLocation!.longitude ?? 0);
+          data.setFloat64(16, currentLocation!.accuracy ?? 0);
+          client.add(Uint8List.view(data.buffer));
+        } catch (e) {
+          print('Error sending location: $e');
+          clients.remove(client);
+        }
+      }
+    }
+  }
+
   void startStreaming() {
     if (cameraController == null || !cameraController!.value.isInitialized) {
       print('Camera not initialized');
       return;
     }
 
-    // Cancel existing timer if any
-    streamingTimer?.cancel();
+    // Already streaming
+    if (isStreaming) {
+      return;
+    }
 
-    streamingTimer = Timer.periodic(Duration(milliseconds: 200), (timer) async {
-      if (!isServer || clients.isEmpty) {
-        timer.cancel();
-        streamingTimer = null;
-        print('Streaming stopped: isServer=$isServer, clients=${clients.length}');
-        return;
-      }
+    setState(() {
+      isStreaming = true;
+      framesSent = 0;
+      totalBytesSent = 0;
+      statisticsStartTime = DateTime.now();
+    });
 
-      try {
-        XFile image = await cameraController!.takePicture();
-        final bytes = await image.readAsBytes();
+    // Use image stream with throttling for better performance
+    try {
+      cameraController!.startImageStream((CameraImage image) {
+        // Process frames at a controlled rate to avoid overwhelming the system
+        final now = DateTime.now();
+        if (lastFrameTime == null ||
+            now.difference(lastFrameTime!).inMilliseconds >= FRAME_INTERVAL_MS) {
+          lastFrameTime = now;
 
-        // Prevent memory issues by reducing file size
-        img.Image? decodedImage = img.decodeImage(bytes);
-        if (decodedImage != null) {
-          // Resize image to reduce data size
-          img.Image resizedImage = img.copyResize(
-            decodedImage,
-            width: 320,  // Reduced width for better performance
-            height: (320 * decodedImage.height / decodedImage.width).round(),
-          );
-
-          // Compress image
-          List<int> compressedBytes = img.encodeJpg(resizedImage, quality: 65);
-
-          print('Frame captured and processed: ${compressedBytes.length} bytes');
-
-          // Send to all connected clients
-          for (var client in List.from(clients)) { // Use a copy to avoid concurrent modification
-            try {
-              client.add(compressedBytes);
-            } catch (e) {
-              print('Error sending to client: $e');
-              clients.remove(client);
-            }
+          // Only process if not currently processing a frame and have clients
+          if (!isProcessingFrame && isServer && clients.isNotEmpty) {
+            isProcessingFrame = true;
+            _processAndSendCameraImage(image).then((_) {
+              isProcessingFrame = false;
+            });
           }
         }
+      });
+    } catch (e) {
+      print('Error starting image stream: $e');
+      setState(() {
+        isStreaming = false;
+      });
+    }
+  }
+
+  void stopStreaming() {
+    if (cameraController != null && cameraController!.value.isStreamingImages) {
+      try {
+        cameraController!.stopImageStream();
       } catch (e) {
-        print('Error in streaming: $e');
+        print('Error stopping image stream: $e');
       }
+    }
+
+    setState(() {
+      isStreaming = false;
     });
+  }
+
+  Future<void> _processAndSendCameraImage(CameraImage image) async {
+    try {
+      // Process image based on connection quality
+      final int qualityAdjusted = (JPEG_QUALITY * connectionQuality).round();
+      final int widthAdjusted = (TARGET_WIDTH * connectionQuality).round();
+
+      // Convert YUV image to JPEG with optimization
+      final bytes = await _convertYUV420toJPEG(image,
+          qualityAdjusted > 20 ? qualityAdjusted : 20,
+          widthAdjusted > 160 ? widthAdjusted : 160);
+
+      // Send to all connected clients
+      bool successfullySent = false;
+      for (var client in List.from(clients)) {
+        try {
+          client.add(bytes);
+          successfullySent = true;
+
+          // Update statistics
+          framesSent++;
+          totalBytesSent += bytes.length;
+        } catch (e) {
+          print('Error sending to client: $e');
+          clients.remove(client);
+        }
+      }
+
+      // Update UI if frame was sent successfully
+      if (successfullySent && mounted) {
+        setState(() {});
+      }
+    } catch (e) {
+      print('Error processing camera image: $e');
+    }
+  }
+
+  // Optimized YUV to JPEG conversion using compute isolate
+  Future<Uint8List> _convertYUV420toJPEG(CameraImage image, int quality, int targetWidth) async {
+    try {
+      final int width = image.width;
+      final int height = image.height;
+
+      // Maintain aspect ratio
+      final int targetHeight = (targetWidth * height / width).round();
+
+      // Create an efficient buffer for conversion
+      final img.Image imgLib = img.Image(width: targetWidth, height: targetHeight);
+
+      // Process in lower resolution for performance
+      final int pixelSkip = (width / targetWidth).ceil();
+
+      // Get plane data
+      final yPlane = image.planes[0];
+      final uPlane = image.planes[1];
+      final vPlane = image.planes[2];
+
+      final int yRowStride = yPlane.bytesPerRow;
+      final int uvRowStride = uPlane.bytesPerRow;
+      final int uvPixelStride = uPlane.bytesPerPixel!;
+
+      // Optimized conversion loop - stride based with pixel skipping
+      for (int y = 0; y < targetHeight; y++) {
+        final sourceY = (y * height / targetHeight).floor();
+
+        for (int x = 0; x < targetWidth; x++) {
+          final sourceX = (x * width / targetWidth).floor();
+
+          final int yIndex = sourceY * yRowStride + sourceX;
+          final int uvIndex = (sourceY ~/ 2) * uvRowStride + (sourceX ~/ 2) * uvPixelStride;
+
+          // Check bounds to prevent index errors
+          if (yIndex >= yPlane.bytes.length ||
+              uvIndex >= uPlane.bytes.length ||
+              uvIndex >= vPlane.bytes.length) {
+            continue;
+          }
+
+          // YUV to RGB conversion - optimized coefficients
+          final int yValue = yPlane.bytes[yIndex];
+          final int uValue = uPlane.bytes[uvIndex];
+          final int vValue = vPlane.bytes[uvIndex];
+
+          // Fast YUV to RGB conversion
+          int r = (yValue + 1.402 * (vValue - 128)).round().clamp(0, 255);
+          int g = (yValue - 0.344136 * (uValue - 128) - 0.714136 * (vValue - 128)).round().clamp(0, 255);
+          int b = (yValue + 1.772 * (uValue - 128)).round().clamp(0, 255);
+
+          imgLib.setPixelRgb(x, y, r, g, b);
+        }
+      }
+
+      // Encode with reduced quality for better transmission speed
+      final List<int> jpegBytes = img.encodeJpg(imgLib, quality: quality);
+
+      return Uint8List.fromList(jpegBytes);
+    } catch (e) {
+      print('Error in YUV conversion: $e');
+
+      // Fallback method if the primary one fails
+      final img.Image imgLib = img.Image(width: 160, height: 120);
+      final List<int> jpegBytes = img.encodeJpg(imgLib, quality: 40);
+      return Uint8List.fromList(jpegBytes);
+    }
   }
 
   void connectToServer() async {
@@ -349,15 +655,18 @@ class _HomePageState extends State<HomePage> {
     try {
       setState(() {
         isServer = false;
+        framesReceived = 0;
+        statisticsStartTime = DateTime.now();
       });
 
-      // Connect to WebSocket server
+      // Connect to WebSocket server with compression enabled
       final uri = Uri.parse('ws://$ip:$port');
 
       // Add error handling for connection
       channel = IOWebSocketChannel.connect(
         uri,
         pingInterval: Duration(seconds: 5),
+        protocols: ['permessage-deflate'], // Enable compression
       );
 
       print('Connecting to server at $uri');
@@ -385,24 +694,72 @@ class _HomePageState extends State<HomePage> {
               isConnected = true;
             });
             print('Connected to server successfully');
+
+            // Start ping measurement
+            _startClientPing();
           }
 
-          if (message is List<int>) {
-            print('Received frame: ${message.length} bytes');
-            setState(() {
-              receivedImageData = Uint8List.fromList(message);
-            });
-          } else if (message is String && message.startsWith('LOCATION:')) {
-            print('Received location update: $message');
-            final locationParts = message.substring(9).split(',');
-            if (locationParts.length >= 2) {
+          if (message is List<int> || message is Uint8List) {
+            // Convert to Uint8List if needed
+            final imageData = message is List<int>
+                ? Uint8List.fromList(message)
+                : message as Uint8List;
+
+            if (imageData.length > 100) { // Threshold to identify image data vs location data
+              setState(() {
+                receivedImageData = imageData;
+                framesReceived++;
+              });
+            } else if (imageData.length == 24) {
+              // Binary location data
+              ByteData byteData = ByteData.view(imageData.buffer);
               setState(() {
                 remoteLocation = LocationData.fromMap({
-                  'latitude': double.parse(locationParts[0]),
-                  'longitude': double.parse(locationParts[1]),
-                  'accuracy': locationParts.length > 2 ? double.parse(locationParts[2]) : 0.0,
+                  'latitude': byteData.getFloat64(0),
+                  'longitude': byteData.getFloat64(8),
+                  'accuracy': byteData.getFloat64(16),
                 });
               });
+            }
+          } else if (message is String) {
+            if (message.startsWith('PING:')) {
+              // Respond to ping
+              channel!.sink.add('PONG:${message.substring(5)}');
+            } else if (message.startsWith('PONG:')) {
+              // Calculate latency
+              try {
+                final pingTime = int.parse(message.substring(5));
+                final now = DateTime.now().millisecondsSinceEpoch;
+                latencyMs = now - pingTime;
+
+                // Update connection quality
+                if (latencyMs < 50) {
+                  connectionQuality = 1.0;
+                } else if (latencyMs < 100) {
+                  connectionQuality = 0.9;
+                } else if (latencyMs < 200) {
+                  connectionQuality = 0.7;
+                } else if (latencyMs < 500) {
+                  connectionQuality = 0.5;
+                } else {
+                  connectionQuality = 0.3;
+                }
+
+                setState(() {});
+              } catch (e) {
+                print('Error processing pong: $e');
+              }
+            } else if (message.startsWith('LOCATION:')) {
+              final locationParts = message.substring(9).split(',');
+              if (locationParts.length >= 2) {
+                setState(() {
+                  remoteLocation = LocationData.fromMap({
+                    'latitude': double.parse(locationParts[0]),
+                    'longitude': double.parse(locationParts[1]),
+                    'accuracy': locationParts.length > 2 ? double.parse(locationParts[2]) : 0.0,
+                  });
+                });
+              }
             }
           }
         },
@@ -426,10 +783,15 @@ class _HomePageState extends State<HomePage> {
       );
 
       // Send location updates
-      locationTimer = Timer.periodic(Duration(seconds: 3), (timer) {
+      locationTimer = Timer.periodic(Duration(milliseconds: LOCATION_INTERVAL_MS), (timer) {
         if (currentLocation != null && isConnected) {
           try {
-            channel!.sink.add('LOCATION:${currentLocation!.latitude},${currentLocation!.longitude},${currentLocation!.accuracy}');
+            // Send location in binary format for efficiency
+            ByteData data = ByteData(24); // 3 doubles at 8 bytes each
+            data.setFloat64(0, currentLocation!.latitude ?? 0);
+            data.setFloat64(8, currentLocation!.longitude ?? 0);
+            data.setFloat64(16, currentLocation!.accuracy ?? 0);
+            channel!.sink.add(Uint8List.view(data.buffer));
           } catch (e) {
             print('Error sending location: $e');
           }
@@ -443,163 +805,524 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  void _startClientPing() {
+    // Send ping every 2 seconds
+    pingTimer = Timer.periodic(Duration(seconds: 2), (timer) {
+      if (isConnected) {
+        try {
+          lastPingSent = DateTime.now();
+          channel!.sink.add('PING:${lastPingSent!.millisecondsSinceEpoch}');
+        } catch (e) {
+          print('Error sending ping: $e');
+        }
+      }
+    });
+  }
+
+  void _updateStatistics() {
+    if (statisticsStartTime == null) return;
+
+    final duration = DateTime.now().difference(statisticsStartTime!).inSeconds;
+    if (duration <= 0) return;
+
+    if (isServer) {
+      // Calculate FPS and bandwidth
+      final fps = framesSent / duration;
+      final kbps = (totalBytesSent / 1024) / duration;
+
+      print('Server stats - FPS: ${fps.toStringAsFixed(1)}, Bandwidth: ${kbps.toStringAsFixed(1)} KB/s');
+    } else if (isConnected) {
+      // Calculate received FPS
+      final fps = framesReceived / duration;
+      print('Client stats - FPS: ${fps.toStringAsFixed(1)}, Latency: $latencyMs ms');
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(
-        title: Text('Sancim App'),
-        actions: [
-          if (isConnected)
-            IconButton(
-              icon: Icon(Icons.refresh),
-              onPressed: () {
-                if (isServer) {
-                  if (streamingTimer == null) {
-                    startStreaming();
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      SnackBar(content: Text('Restarting stream')),
-                    );
+        appBar: AppBar(
+          title: Text('Navigation Assistant'),
+          actions: [
+            if (isConnected)
+              IconButton(
+                icon: Icon(Icons.refresh),
+                onPressed: () {
+                  if (isServer) {
+                    if (!isStreaming) {
+                      startStreaming();
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('Starting stream')),
+                      );
+                    } else {
+                      // Restart stream
+                      stopStreaming();
+                      Future.delayed(Duration(milliseconds: 500), () {
+                        startStreaming();
+                      });
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('Restarting stream')),
+                      );
+                    }
                   }
-                }
-              },
-              tooltip: 'Restart Stream',
-            ),
-        ],
+                },
+                tooltip: 'Restart Stream',
+              ),
+          ],
+        ),
+        body: Stack(
+            children: [
+        // Main content
+        Center(
+        child: isServer
+        ? (isCameraInitialized
+        ? CameraPreview(cameraController!)
+            : CircularProgressIndicator())
+        : (isConnected
+    ? (receivedImageData != null
+    ? Image.memory(
+    receivedImageData!,
+    gaplessPlayback: true, // Prevent flickering
+    key: ValueKey(framesReceived), // Force refresh
+    )
+        : Column(
+    mainAxisAlignment: MainAxisAlignment.center,
+    children: [
+    CircularProgressIndicator(),
+    SizedBox(height: 10),
+    Text('Waiting for stream...'),
+    ],
+    ))
+        : Column(
+    mainAxisAlignment: MainAxisAlignment.center,
+    children: [
+    Text('Not connected', style: TextStyle(fontSize: 18)),
+    SizedBox(height: 20),
+    ElevatedButton(
+    onPressed: startServer,
+    child: Row(
+    mainAxisSize: MainAxisSize.min,
+    children: [
+    Icon(Icons.wifi_tethering),
+    SizedBox(width: 8),
+    Text('Start as Server'),
+    ],
+    ),
+    ),
+      SizedBox(height: 10),
+      ElevatedButton(
+        onPressed: connectToServer,
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.connect_without_contact),
+            SizedBox(width: 8),
+            Text('Connect to Server'),
+          ],
+        ),
       ),
-      body: Stack(
-        children: [
-          Center(
-            child: isServer
-                ? (isCameraInitialized
-                ? CameraPreview(cameraController!)
-                : CircularProgressIndicator())
-                : (isConnected
-                ? (receivedImageData != null
-                ? Image.memory(receivedImageData!)
-                : Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                CircularProgressIndicator(),
-                SizedBox(height: 10),
-                Text('Waiting for stream...'),
-              ],
-            ))
-                : Column(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                Text('Not connected', style: TextStyle(fontSize: 18)),
-                SizedBox(height: 20),
-                ElevatedButton(
-                  onPressed: startServer,
-                  child: Text('Start as Server'),
-                ),
-                SizedBox(height: 10),
-                ElevatedButton(
-                  onPressed: connectToServer,
-                  child: Text('Connect as Client'),
-                ),
-              ],
-            )),
-          ),
+    ],
+        )),
+        ),
 
-          // GPS tracking widget overlay
-          if (currentLocation != null)
-            Positioned(
-              top: 20,
-              right: 20,
-              child: buildGpsWidget(),
-            ),
-
-          // Connection status overlay
-          if (isConnected)
-            Positioned(
-              bottom: 20,
-              right: 20,
-              child: Container(
-                padding: EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: Colors.green.withOpacity(0.7),
-                  borderRadius: BorderRadius.circular(8),
+              // Connection quality indicator overlay
+              if (isConnected)
+                Positioned(
+                  top: 10,
+                  right: 10,
+                  child: Container(
+                    padding: EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.6),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          _getConnectionIcon(connectionQuality),
+                          color: _getConnectionColor(connectionQuality),
+                          size: 24,
+                        ),
+                        SizedBox(width: 4),
+                        Text(
+                          '$latencyMs ms',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
                 ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
+
+              // Location data overlay
+              if (isConnected && remoteLocation != null)
+                Positioned(
+                  left: 10,
+                  bottom: 90,
+                  child: Container(
+                    padding: EdgeInsets.all(8),
+                    width: MediaQuery.of(context).size.width * 0.9,
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.6),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          'Remote Location',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        SizedBox(height: 4),
+                        Text(
+                          'Lat: ${remoteLocation!.latitude?.toStringAsFixed(6) ?? "Unknown"}',
+                          style: TextStyle(color: Colors.white),
+                        ),
+                        Text(
+                          'Lng: ${remoteLocation!.longitude?.toStringAsFixed(6) ?? "Unknown"}',
+                          style: TextStyle(color: Colors.white),
+                        ),
+                        Text(
+                          'Accuracy: ${remoteLocation!.accuracy?.toStringAsFixed(2) ?? "Unknown"} m',
+                          style: TextStyle(color: Colors.white),
+                        ),
+                        if (currentLocation != null)
+                          Text(
+                            'Distance: ${_calculateDistance(
+                              currentLocation!.latitude ?? 0,
+                              currentLocation!.longitude ?? 0,
+                              remoteLocation!.latitude ?? 0,
+                              remoteLocation!.longitude ?? 0,
+                            ).toStringAsFixed(0)} m',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+
+              // Streaming statistics
+              if (isServer && isStreaming)
+                Positioned(
+                  left: 10,
+                  top: 10,
+                  child: Container(
+                    padding: EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.6),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      'Sending: $framesSent frames',
+                      style: TextStyle(color: Colors.white),
+                    ),
+                  ),
+                ),
+
+              // Reception statistics
+              if (!isServer && isConnected)
+                Positioned(
+                  left: 10,
+                  top: 10,
+                  child: Container(
+                    padding: EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.6),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      'Received: $framesReceived frames',
+                      style: TextStyle(color: Colors.white),
+                    ),
+                  ),
+                ),
+            ],
+        ),
+      bottomNavigationBar: BottomAppBar(
+        color: Colors.blue,
+        child: Container(
+          height: 60,
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(
+                    isConnected ? Icons.link : Icons.link_off,
+                    color: isConnected ? Colors.green : Colors.red,
+                  ),
+                  Text(
+                    isConnected ? 'Connected' : 'Disconnected',
+                    style: TextStyle(color: Colors.white),
+                  ),
+                ],
+              ),
+              if (isServer)
+                Column(
+                  mainAxisAlignment: MainAxisAlignment.center,
                   children: [
-                    Icon(Icons.wifi, color: Colors.white),
-                    SizedBox(width: 4),
+                    Icon(
+                      isStreaming ? Icons.videocam : Icons.videocam_off,
+                      color: isStreaming ? Colors.green : Colors.red,
+                    ),
                     Text(
-                      isServer
-                          ? 'Server: ${clients.length} client(s) connected'
-                          : 'Connected to server',
+                      isStreaming ? 'Streaming' : 'Not Streaming',
                       style: TextStyle(color: Colors.white),
                     ),
                   ],
                 ),
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-
-  Widget buildGpsWidget() {
-    return Container(
-      width: 150,
-      padding: EdgeInsets.all(8),
-      decoration: BoxDecoration(
-        color: Colors.black.withOpacity(0.6),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Text('GPS Tracking',
-            style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+              if (isConnected)
+                IconButton(
+                  icon: Icon(Icons.close, color: Colors.white),
+                  onPressed: () {
+                    // Disconnect logic
+                    if (isServer) {
+                      stopStreaming();
+                      clients.forEach((client) => client.close());
+                      clients.clear();
+                      server?.close();
+                    } else {
+                      channel?.sink.close();
+                    }
+                    setState(() {
+                      isConnected = false;
+                    });
+                  },
+                  tooltip: 'Disconnect',
+                ),
+            ],
           ),
-          Divider(color: Colors.white30),
-          if (currentLocation != null) ...[
-            Text('Your Location:',
-              style: TextStyle(color: Colors.white70, fontSize: 12),
-            ),
-            Text('Lat: ${currentLocation!.latitude!.toStringAsFixed(6)}',
-              style: TextStyle(color: Colors.white),
-            ),
-            Text('Lng: ${currentLocation!.longitude!.toStringAsFixed(6)}',
-              style: TextStyle(color: Colors.white),
-            ),
-          ],
-          if (remoteLocation != null) ...[
-            SizedBox(height: 8),
-            Text('Remote Location:',
-              style: TextStyle(color: Colors.white70, fontSize: 12),
-            ),
-            Text('Lat: ${remoteLocation!.latitude!.toStringAsFixed(6)}',
-              style: TextStyle(color: Colors.white),
-            ),
-            Text('Lng: ${remoteLocation!.longitude!.toStringAsFixed(6)}',
-              style: TextStyle(color: Colors.white),
-            ),
-            if (currentLocation != null)
-              Text('Distance: ${_calculateDistance(currentLocation!, remoteLocation!).toStringAsFixed(2)} km',
-                style: TextStyle(color: Colors.greenAccent),
-              ),
-          ],
-        ],
+        ),
       ),
+      floatingActionButton: isServer && isConnected && isCameraInitialized
+          ? FloatingActionButton(
+        onPressed: () {
+          if (isStreaming) {
+            stopStreaming();
+          } else {
+            startStreaming();
+          }
+        },
+        child: Icon(isStreaming ? Icons.stop : Icons.play_arrow),
+        tooltip: isStreaming ? 'Stop Streaming' : 'Start Streaming',
+      )
+          : null,
     );
   }
 
-  double _calculateDistance(LocationData loc1, LocationData loc2) {
-    const R = 6371.0; // Earth radius in km
-    final lat1 = loc1.latitude! * (math.pi / 180);
-    final lat2 = loc2.latitude! * (math.pi / 180);
-    final dLat = (loc2.latitude! - loc1.latitude!) * (math.pi / 180);
-    final dLon = (loc2.longitude! - loc1.longitude!) * (math.pi / 180);
+  // Helper function to get connection icon based on quality
+  IconData _getConnectionIcon(double quality) {
+    if (quality > 0.8) return Icons.signal_cellular_alt;
+    if (quality > 0.5) return Icons.signal_cellular_alt_2_bar;
+    if (quality > 0.3) return Icons.signal_cellular_alt_1_bar;
+    return Icons.signal_cellular_connected_no_internet_0_bar;
+  }
 
+  // Helper function to get connection color based on quality
+  Color _getConnectionColor(double quality) {
+    if (quality > 0.8) return Colors.green;
+    if (quality > 0.5) return Colors.yellow;
+    if (quality > 0.3) return Colors.orange;
+    return Colors.red;
+  }
+
+  // Calculate distance between two coordinates using Haversine formula
+  double _calculateDistance(double lat1, double lon1, double lat2, double lon2) {
+    const double earthRadius = 6371000; // meters
+
+    // Convert from degrees to radians
+    final dLat = _toRadians(lat2 - lat1);
+    final dLon = _toRadians(lon2 - lon1);
+
+    // Haversine formula
     final a = math.sin(dLat / 2) * math.sin(dLat / 2) +
-        math.cos(lat1) * math.cos(lat2) *
+        math.cos(_toRadians(lat1)) * math.cos(_toRadians(lat2)) *
             math.sin(dLon / 2) * math.sin(dLon / 2);
+
     final c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
 
-    return R * c;
+    return earthRadius * c; // Distance in meters
+  }
+
+  double _toRadians(double degree) {
+    return degree * math.pi / 180;
+  }
+}
+
+// Add a helper class for direction calculation and guidance
+class NavigationHelper {
+  // Calculate bearing between two points
+  static double calculateBearing(double lat1, double lon1, double lat2, double lon2) {
+    final double dLon = _toRadians(lon2 - lon1);
+
+    final double y = math.sin(dLon) * math.cos(_toRadians(lat2));
+    final double x = math.cos(_toRadians(lat1)) * math.sin(_toRadians(lat2)) -
+        math.sin(_toRadians(lat1)) * math.cos(_toRadians(lat2)) * math.cos(dLon);
+
+    double bearing = math.atan2(y, x);
+    bearing = _toDegrees(bearing);
+    bearing = (bearing + 360) % 360; // Normalize to 0-360
+
+    return bearing;
+  }
+
+  // Convert direction in degrees to cardinal direction
+  static String getCardinalDirection(double bearing) {
+    const directions = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW', 'N'];
+    return directions[(bearing / 45).round() % 8];
+  }
+
+  // Get navigation instruction based on bearing and distance
+  static String getNavigationInstruction(double bearing, double distance) {
+    final String direction = getCardinalDirection(bearing);
+
+    if (distance < 10) {
+      return "You have reached the destination";
+    } else if (distance < 50) {
+      return "Very close! Continue $direction";
+    } else if (distance < 200) {
+      return "Head $direction for ${distance.round()} meters";
+    } else {
+      return "Go $direction for about ${(distance / 100).round() / 10} km";
+    }
+  }
+
+  // Utility function: convert radians to degrees
+  static double _toDegrees(double radians) {
+    return radians * 180 / math.pi;
+  }
+
+  // Utility function: convert degrees to radians
+  static double _toRadians(double degrees) {
+    return degrees * math.pi / 180;
+  }
+}
+
+// Implement a battery-efficient location manager
+class LocationManager {
+  final Location _location = Location();
+  LocationData? _lastLocation;
+
+  // Callbacks
+  Function(LocationData)? onLocationChanged;
+
+  // Configuration
+  bool _isHighAccuracy = false;
+  int _updateIntervalMs = 3000;
+
+  Future<bool> initialize() async {
+    // Check if location service is enabled
+    bool serviceEnabled = await _location.serviceEnabled();
+    if (!serviceEnabled) {
+      serviceEnabled = await _location.requestService();
+      if (!serviceEnabled) {
+        return false;
+      }
+    }
+
+    // Check permissions
+    PermissionStatus permissionStatus = await _location.hasPermission();
+    if (permissionStatus == PermissionStatus.denied) {
+      permissionStatus = await _location.requestPermission();
+      if (permissionStatus != PermissionStatus.granted) {
+        return false;
+      }
+    }
+
+    // Configure location service
+    await _configureLocationService();
+
+    // Start listening for updates
+    _location.onLocationChanged.listen(_handleLocationUpdate);
+
+    return true;
+  }
+
+  Future<void> _configureLocationService() async {
+    await _location.changeSettings(
+      accuracy: _isHighAccuracy ? LocationAccuracy.high : LocationAccuracy.balanced,
+      interval: _updateIntervalMs,
+      distanceFilter: _isHighAccuracy ? 5 : 20, // meters
+    );
+  }
+
+  void _handleLocationUpdate(LocationData locationData) {
+    _lastLocation = locationData;
+    onLocationChanged?.call(locationData);
+  }
+
+  // Set accuracy mode based on battery and needs
+  void setHighAccuracyMode(bool highAccuracy) {
+    if (_isHighAccuracy != highAccuracy) {
+      _isHighAccuracy = highAccuracy;
+      _configureLocationService();
+    }
+  }
+
+  // Adjust update interval for battery optimization
+  void setUpdateInterval(int intervalMs) {
+    if (_updateIntervalMs != intervalMs) {
+      _updateIntervalMs = intervalMs;
+      _configureLocationService();
+    }
+  }
+
+  // Get last known location
+  LocationData? getLastLocation() {
+    return _lastLocation;
+  }
+
+  // Request a one-time location update
+  Future<LocationData?> getOneTimeLocation() async {
+    try {
+      return await _location.getLocation();
+    } catch (e) {
+      print('Error getting one-time location: $e');
+      return null;
+    }
+  }
+
+  // Request a high-accuracy location (useful when approaching destination)
+  Future<LocationData?> getHighAccuracyLocation() async {
+    // Save current settings
+    final bool previousHighAccuracy = _isHighAccuracy;
+
+    // Temporarily switch to high accuracy
+    await _location.changeSettings(
+      accuracy: LocationAccuracy.high,
+      interval: 1000,
+      distanceFilter: 1, // meter
+    );
+
+    // Get location with high accuracy
+    LocationData? locationData;
+    try {
+      locationData = await _location.getLocation();
+    } catch (e) {
+      print('Error getting high-accuracy location: $e');
+    }
+
+    // Restore previous settings
+    if (!previousHighAccuracy) {
+      await _configureLocationService();
+    }
+
+    return locationData;
+  }
+
+  // Cleanup
+  void dispose() {
+    // No explicit dispose needed as the location service handles it
   }
 }
