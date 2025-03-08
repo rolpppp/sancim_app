@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
@@ -13,6 +14,9 @@ import 'package:flutter/services.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart'; // For LatLng coordinates
+import 'package:flutter_bluetooth_serial/flutter_bluetooth_serial.dart';
+import 'package:flutter_tts/flutter_tts.dart';
+import 'package:permission_handler/permission_handler.dart';
 
 // Constants for optimization
 const int TARGET_WIDTH = 256;
@@ -78,6 +82,29 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   bool isCameraInitialized = false;
   bool isStreaming = false;
 
+  // Bluetooth
+  FlutterBluetoothSerial _bluetooth = FlutterBluetoothSerial.instance;
+  BluetoothConnection? btConnection;
+  bool isBtConnecting = false;
+  bool isBtConnected = false;
+  bool isBtDisconnecting = false;
+
+  // Text-to-Speech
+  FlutterTts flutterTts = FlutterTts();
+
+  // Arduino data
+  String receivedData = "";
+  String lastAlert = "";
+  Map<String, int> sensorData = {
+    'Left': 0,
+    'Front': 0,
+    'Right': 0,
+    'Battery': 0,
+  };
+
+  // Device details
+  String deviceAddress = "98:D3:71:F7:06:9B"; // HC-05 MAC address
+
   // Optimization: Use a flag to control frame processing
   bool isProcessingFrame = false;
 
@@ -111,6 +138,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     checkPermissions();
+    _initPermissions();
+    _initTextToSpeech();
 
     // Initialize statistics timer
     statisticsTimer = Timer.periodic(Duration(seconds: 5), (_) {
@@ -140,6 +169,210 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     }
   }
 
+  Future<void> _initPermissions() async {
+    // Request necessary permissions
+    await Permission.bluetooth.request();
+    await Permission.bluetoothConnect.request();
+    await Permission.bluetoothScan.request();
+    await Permission.microphone.request();
+    await Permission.camera.request();
+  }
+
+  Future<void> _initTextToSpeech() async {
+    await flutterTts.setLanguage("en-US");
+    await flutterTts.setSpeechRate(0.5);
+    await flutterTts.setVolume(1.0);
+    await flutterTts.setPitch(1.0);
+  }
+
+  Widget _buildSensorIndicator(String label, int value) {
+    Color color = Colors.green;
+    if (value <= 10) {
+      color = Colors.red;
+    } else if (value <= 20) {
+      color = Colors.orange;
+    }
+
+    return Column(
+      children: [
+        Container(
+          width: 60,
+          height: 60,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: color.withOpacity(0.2),
+            border: Border.all(color: color, width: 2),
+          ),
+          child: Center(
+            child: Text(
+              "$value cm",
+              style: TextStyle(
+                fontSize: 14,
+                fontWeight: FontWeight.bold,
+                color: color,
+              ),
+            ),
+          ),
+        ),
+        SizedBox(height: 4),
+        Text(label, style: TextStyle(fontSize: 12)),
+      ],
+    );
+  }
+
+  void _showErrorDialog(String message) {
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text("Error"),
+          content: Text(message),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+              child: Text("OK"),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void scanForArduino() async {
+    List<BluetoothDevice> devices = [];
+
+    try {
+      devices = await _bluetooth.getBondedDevices();
+    } catch (e) {
+      _showErrorDialog("Failed to get Bluetooth devices: ${e.toString()}");
+      return;
+    }
+
+    if (devices.isEmpty) {
+      _showErrorDialog("No paired Bluetooth devices found. Please pair your HC-05 in device settings first.");
+      return;
+    }
+
+
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text("Select HC-05 Device"),
+          content: Container(
+            width: double.maxFinite,
+            height: 300,
+            child: ListView.builder(
+              itemCount: devices.length,
+              itemBuilder: (context, index) {
+                return ListTile(
+                  title: Text(devices[index].name ?? "Unknown Device"),
+                  subtitle: Text(devices[index].address),
+                  onTap: () {
+                    setState(() {
+                      deviceAddress = devices[index].address;
+                    });
+                    Navigator.of(context).pop();
+                    connectToArduino();
+                  },
+                );
+              },
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+              },
+              child: Text("Cancel"),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void connectToArduino() async {
+    if (deviceAddress.isEmpty) {
+      scanForArduino();
+      return;
+    }
+
+    setState(() {
+      isBtConnecting = true;
+    });
+
+    try {
+      btConnection = await BluetoothConnection.toAddress(deviceAddress);
+
+      setState(() {
+        isBtConnecting = false;
+        isBtConnected = true;
+      });
+
+      // Listen for incoming data from Arduino
+      btConnection!.input!.listen((Uint8List data) {
+        String dataString = ascii.decode(data).trim();
+        _processReceivedData(dataString);
+      }).onDone(() {
+        setState(() {
+          isBtConnected = false;
+        });
+      });
+
+    } catch (e) {
+      setState(() {
+        isBtConnecting = false;
+      });
+      _showErrorDialog("Failed to connect to Arduino: ${e.toString()}");
+    }
+  }
+
+  void disconnectFromArduino() async {
+    setState(() {
+      isBtDisconnecting = true;
+    });
+
+    await btConnection?.close();
+
+    setState(() {
+      isBtDisconnecting = false;
+      isBtConnected = false;
+    });
+  }
+
+  Future<void> _speakMessage(String message) async {
+    await flutterTts.speak(message);
+  }
+
+  void _processReceivedData(String data) {
+    setState(() {
+      receivedData = data;
+    });
+
+    if (receivedData == "TB"){
+      _speakMessage("Turn Back");
+    }else if (receivedData == "OAS"){
+      _speakMessage("Obstacle Ahead, Stop");
+    }else if (receivedData == "SRTN"){
+      _speakMessage("Sharp Right Turn Needed");
+    }else if (receivedData == "TR"){
+      _speakMessage("Turn Right");
+    }else if (receivedData == "OB"){
+      _speakMessage("Obstacle on Both Sides, Proceed with Caution");
+    }else if (receivedData == "SLRN"){
+      _speakMessage("Sharp Left Turn Needed");
+    }else if (receivedData == "TL"){
+      _speakMessage("Turn Left");
+    }else if (receivedData == "PC"){
+      _speakMessage("Path Clear Proceed");
+    }else if (receivedData == "NP"){
+      _speakMessage("Caution! Narrow Passage");
+    }
+  }
+
   void _cleanupResources() {
     stopStreaming();
     cameraController?.dispose();
@@ -158,12 +391,12 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       serviceEnabled = await location.requestService();
       if (!serviceEnabled) return;
     }
-
+    /*
     PermissionStatus permissionStatus = await location.hasPermission();
     if (permissionStatus == PermissionStatus.denied) {
       permissionStatus = await location.requestPermission();
       if (permissionStatus != PermissionStatus.granted) return;
-    }
+    }*/
 
     // Configure location service for better accuracy
     await location.changeSettings(
@@ -884,266 +1117,272 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-        appBar: AppBar(
-          title: Text('Navigation Assistant'),
-          actions: [
-            if (isConnected)
-              IconButton(
-                icon: Icon(Icons.refresh),
-                onPressed: () {
-                  if (isServer) {
-                    if (!isStreaming) {
+      appBar: AppBar(
+        title: Text('Navigation Assistant'),
+        actions: [
+          if (isConnected)
+            IconButton(
+              icon: Icon(Icons.refresh),
+              onPressed: () {
+                if (isServer) {
+                  if (!isStreaming) {
+                    startStreaming();
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Starting stream')),
+                    );
+                  } else {
+                    // Restart stream
+                    stopStreaming();
+                    Future.delayed(Duration(milliseconds: 500), () {
                       startStreaming();
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text('Starting stream')),
-                      );
-                    } else {
-                      // Restart stream
-                      stopStreaming();
-                      Future.delayed(Duration(milliseconds: 500), () {
-                        startStreaming();
-                      });
-                      ScaffoldMessenger.of(context).showSnackBar(
-                        SnackBar(content: Text('Restarting stream')),
-                      );
-                    }
+                    });
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Restarting stream')),
+                    );
                   }
-                },
-                tooltip: 'Restart Stream',
-              ),
-          ],
-        ),
-        body: Stack(
-            children: [
-              // Main content
-              Center(
-                child: isServer
-                  ? (isCameraInitialized
-                    ? CameraPreview(cameraController!)
-                    : CircularProgressIndicator())
-                  : (isConnected
-                    ? (receivedImageData != null
-                      ? Image.memory(
-                        receivedImageData!,
-                        gaplessPlayback: true, // Prevent flickering
-                        key: ValueKey(framesReceived), // Force refresh
-                        )
-                      : Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          CircularProgressIndicator(),
-                          SizedBox(height: 10),
-                          Text('Waiting for stream...'),
-                        ],
-                      ))
-                 : Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
+                }
+              },
+              tooltip: 'Restart Stream',
+            ),
+            // New bluetooth icon button
+            IconButton(
+              icon: Icon(isBtConnected ? Icons.bluetooth_connected : Icons.bluetooth),
+              onPressed: isBtConnected ? disconnectFromArduino : scanForArduino,
+              tooltip: isBtConnected ? "Disconnect Arduino" : "Connect Arduino",
+            ),
+        ],
+      ),
+      body: Stack(
+        children: [
+          // Main content
+          Center(
+            child: isServer
+                ? (isCameraInitialized
+                ? CameraPreview(cameraController!)
+                : CircularProgressIndicator())
+                : (isConnected
+                ? (receivedImageData != null
+                ? Image.memory(
+              receivedImageData!,
+              gaplessPlayback: true, // Prevent flickering
+              key: ValueKey(framesReceived), // Force refresh
+            )
+                : Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                CircularProgressIndicator(),
+                SizedBox(height: 10),
+                Text('Waiting for stream...'),
+              ],
+            ))
+                : Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Text('Not connected', style: TextStyle(fontSize: 18)),
+                SizedBox(height: 20),
+                ElevatedButton(
+                  onPressed: startServer,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
                     children: [
-                      Text('Not connected', style: TextStyle(fontSize: 18)),
-                      SizedBox(height: 20),
-                      ElevatedButton(
-                        onPressed: startServer,
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(Icons.wifi_tethering),
-                            SizedBox(width: 8),
-                            Text('Start as Server'),
-                          ],
-                        ),
+                      Icon(Icons.wifi_tethering),
+                      SizedBox(width: 8),
+                      Text('Start as Server'),
+                    ],
+                  ),
+                ),
+                SizedBox(height: 10),
+                ElevatedButton(
+                  onPressed: connectToServer,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(Icons.connect_without_contact),
+                      SizedBox(width: 8),
+                      Text('Connect to Server'),
+                    ],
+                  ),
+                ),
+              ],
+            )),
+          ),
+
+          // Map overlay
+          if (!isServer && isConnected && remoteLocation != null)
+            Positioned(
+              left: 10,
+              top: 50,
+              right: 10,
+              child: Container(
+                height: 250, // Fixed height for the map
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.6),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(10),
+                  child: FlutterMap(
+                    mapController: _mapController,
+                    options: MapOptions(
+                      center: LatLng(
+                        remoteLocation!.latitude!,
+                        remoteLocation!.longitude!,
                       ),
-                      SizedBox(height: 10),
-                      ElevatedButton(
-                        onPressed: connectToServer,
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(Icons.connect_without_contact),
-                            SizedBox(width: 8),
-                            Text('Connect to Server'),
-                          ],
-                        ),
+                      zoom: 15.0, // Initial zoom level
+                    ),
+                    children: [
+                      // OpenStreetMap tiles
+                      TileLayer(
+                        urlTemplate: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+                        subdomains: ['a', 'b', 'c'],
+                      ),
+                      // Marker for the server's location
+                      MarkerLayer(
+                        markers: [
+                          Marker(
+                            width: 40.0,
+                            height: 40.0,
+                            point: LatLng(
+                              remoteLocation!.latitude!,
+                              remoteLocation!.longitude!,
+                            ),
+                            builder: (ctx) => Icon(
+                              Icons.location_pin,
+                              color: Colors.red,
+                              size: 40.0,
+                            ),
+                          ),
+                        ],
                       ),
                     ],
-                )),
+                  ),
+                ),
               ),
+            ),
 
-              // Map overlay
-              if (!isServer && isConnected && remoteLocation != null)
-                Positioned(
-                  left: 10,
-                  top: 50,
-                  right: 10,
-                  child: Container(
-                      height: 250, // Fixed height for the map
-                      decoration: BoxDecoration(
-                        color: Colors.black.withOpacity(0.6),
-                        borderRadius: BorderRadius.circular(10),
+          // Connection quality indicator overlay
+          if (isConnected)
+            Positioned(
+              top: 10,
+              right: 10,
+              child: Container(
+                padding: EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.6),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Icon(
+                      _getConnectionIcon(connectionQuality),
+                      color: _getConnectionColor(connectionQuality),
+                      size: 24,
+                    ),
+                    SizedBox(width: 4),
+                    Text(
+                      '$latencyMs ms',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
                       ),
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(10),
-                        child: FlutterMap(
-                            mapController: _mapController,
-                            options: MapOptions(
-                              center: LatLng(
-                                remoteLocation!.latitude!,
-                                remoteLocation!.longitude!,
-                              ),
-                              zoom: 15.0, // Initial zoom level
-                            ),
-                              children: [
-                              // OpenStreetMap tiles
-                                TileLayer(
-                                urlTemplate: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
-                                subdomains: ['a', 'b', 'c'],
-                              ),
-                                // Marker for the server's location
-                                MarkerLayer(
-                                  markers: [
-                                    Marker(
-                                      width: 40.0,
-                                      height: 40.0,
-                                        point: LatLng(
-                                          remoteLocation!.latitude!,
-                                          remoteLocation!.longitude!,
-                                        ),
-                                      builder: (ctx) => Icon(
-                                        Icons.location_pin,
-                                        color: Colors.red,
-                                        size: 40.0,
-                                      ),
-                                     ),
-                                ],
-                              ),
-                              ],
-                        ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+          // Location data overlay
+          if (isConnected && remoteLocation != null)
+            Positioned(
+              left: 10,
+              bottom: 90,
+              child: Container(
+                padding: EdgeInsets.all(8),
+                width: MediaQuery.of(context).size.width - 10,
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.6),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      'Remote Location',
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.bold,
                       ),
-                  ),
-                ),
-
-              // Connection quality indicator overlay
-              if (isConnected)
-                Positioned(
-                  top: 10,
-                  right: 10,
-                  child: Container(
-                    padding: EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: Colors.black.withOpacity(0.6),
-                      borderRadius: BorderRadius.circular(10),
                     ),
-                    child: Row(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(
-                          _getConnectionIcon(connectionQuality),
-                          color: _getConnectionColor(connectionQuality),
-                          size: 24,
-                        ),
-                        SizedBox(width: 4),
-                        Text(
-                          '$latencyMs ms',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-                ),
-
-              // Location data overlay
-              if (isConnected && remoteLocation != null)
-                Positioned(
-                  left: 10,
-                  bottom: 90,
-                  child: Container(
-                    padding: EdgeInsets.all(8),
-                    width: MediaQuery.of(context).size.width - 10,
-                    decoration: BoxDecoration(
-                      color: Colors.black.withOpacity(0.6),
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Text(
-                          'Remote Location',
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
-                        SizedBox(height: 4),
-                        Text(
-                          'Lat: ${remoteLocation!.latitude?.toStringAsFixed(6) ?? "Unknown"}',
-                          style: TextStyle(color: Colors.white),
-                        ),
-                        Text(
-                          'Lng: ${remoteLocation!.longitude?.toStringAsFixed(6) ?? "Unknown"}',
-                          style: TextStyle(color: Colors.white),
-                        ),
-                        Text(
-                          'Accuracy: ${remoteLocation!.accuracy?.toStringAsFixed(2) ?? "Unknown"} m',
-                          style: TextStyle(color: Colors.white),
-                        ),
-                        if (currentLocation != null)
-                          Text(
-                            'Distance: ${_calculateDistance(
-                              currentLocation!.latitude ?? 0,
-                              currentLocation!.longitude ?? 0,
-                              remoteLocation!.latitude ?? 0,
-                              remoteLocation!.longitude ?? 0,
-                            ).toStringAsFixed(0)} m',
-                            style: TextStyle(
-                              color: Colors.white,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                      ],
-                    ),
-                  ),
-                ),
-
-              // Streaming statistics
-              if (isServer && isStreaming)
-                Positioned(
-                  left: 10,
-                  top: 10,
-                  child: Container(
-                    padding: EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: Colors.black.withOpacity(0.6),
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    child: Text(
-                      'Sending: $framesSent frames',
+                    SizedBox(height: 4),
+                    Text(
+                      'Lat: ${remoteLocation!.latitude?.toStringAsFixed(6) ?? "Unknown"}',
                       style: TextStyle(color: Colors.white),
                     ),
-                  ),
-                ),
-
-              // Reception statistics
-              if (!isServer && isConnected)
-                Positioned(
-                  left: 10,
-                  top: 10,
-                  child: Container(
-                    padding: EdgeInsets.all(8),
-                    decoration: BoxDecoration(
-                      color: Colors.black.withOpacity(0.6),
-                      borderRadius: BorderRadius.circular(10),
-                    ),
-                    child: Text(
-                      'Received: $framesReceived frames',
+                    Text(
+                      'Lng: ${remoteLocation!.longitude?.toStringAsFixed(6) ?? "Unknown"}',
                       style: TextStyle(color: Colors.white),
                     ),
-                  ),
+                    Text(
+                      'Accuracy: ${remoteLocation!.accuracy?.toStringAsFixed(2) ?? "Unknown"} m',
+                      style: TextStyle(color: Colors.white),
+                    ),
+                    if (currentLocation != null)
+                      Text(
+                        'Distance: ${_calculateDistance(
+                          currentLocation!.latitude ?? 0,
+                          currentLocation!.longitude ?? 0,
+                          remoteLocation!.latitude ?? 0,
+                          remoteLocation!.longitude ?? 0,
+                        ).toStringAsFixed(0)} m',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                  ],
                 ),
-            ],
-        ),
+              ),
+            ),
+
+          // Streaming statistics
+          if (isServer && isStreaming)
+            Positioned(
+              left: 10,
+              top: 10,
+              child: Container(
+                padding: EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.6),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  'Sending: $framesSent frames',
+                  style: TextStyle(color: Colors.white),
+                ),
+              ),
+            ),
+
+          // Reception statistics
+          if (!isServer && isConnected)
+            Positioned(
+              left: 10,
+              top: 10,
+              child: Container(
+                padding: EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.black.withOpacity(0.6),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  'Received: $framesReceived frames',
+                  style: TextStyle(color: Colors.white),
+                ),
+              ),
+            ),
+        ],
+      ),
       bottomNavigationBar: BottomAppBar(
         color: Colors.blue,
         child: Container(
@@ -1327,6 +1566,7 @@ class LocationManager {
       }
     }
 
+    /*
     // Check permissions
     PermissionStatus permissionStatus = await _location.hasPermission();
     if (permissionStatus == PermissionStatus.denied) {
@@ -1334,7 +1574,7 @@ class LocationManager {
       if (permissionStatus != PermissionStatus.granted) {
         return false;
       }
-    }
+    }*/
 
     // Configure location service
     await _configureLocationService();

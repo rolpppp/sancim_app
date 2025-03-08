@@ -39,7 +39,9 @@ dependencies:
   path_provider: ^2.1.1    # For file path management (optional)
   flutter_map: ^5.0.0      # For maps
   latlong2: ^0.9.0
-
+  flutter_bluetooth_serial: ^0.4.0
+  flutter_tts: ^4.2.2
+  permission_handler: ^10.2.0
 
 dev_dependencies:
   flutter_test:
