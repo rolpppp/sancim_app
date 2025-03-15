@@ -1,8 +1,11 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:collection';
+import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:camera/camera.dart';
 import 'package:image/image.dart' as img;
@@ -19,9 +22,9 @@ import 'package:flutter_tts/flutter_tts.dart';
 import 'package:permission_handler/permission_handler.dart';
 
 // Constants for optimization
-const int TARGET_WIDTH = 256;
-const int JPEG_QUALITY = 40;
-const int FRAME_INTERVAL_MS = 300; // 30 fps
+const int TARGET_WIDTH = 640;
+const int JPEG_QUALITY = 65;
+const int FRAME_INTERVAL_MS = 100; // 30 fps
 const int LOCATION_INTERVAL_MS = 3000;
 
 void main() async {
@@ -91,16 +94,17 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   // Text-to-Speech
   FlutterTts flutterTts = FlutterTts();
+  Queue<String> ttsQueue = Queue<String>();
+  bool isSpeaking = false;
+  Timer? ttsQueueTimer;
+
+
+  // Define priority messages that should interrupt current speech
+  Set<String> priorityMessages = {'TB', 'OAS', 'CD'};
 
   // Arduino data
   String receivedData = "";
   String lastAlert = "";
-  Map<String, int> sensorData = {
-    'Left': 0,
-    'Front': 0,
-    'Right': 0,
-    'Battery': 0,
-  };
 
   // Device details
   String deviceAddress = "98:D3:71:F7:06:9B"; // HC-05 MAC address
@@ -151,6 +155,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _cleanupResources();
+    ttsQueueTimer?.cancel();
+    flutterTts.stop();
     super.dispose();
   }
 
@@ -180,9 +186,48 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Future<void> _initTextToSpeech() async {
     await flutterTts.setLanguage("en-US");
-    await flutterTts.setSpeechRate(0.5);
+    await flutterTts.setSpeechRate(0.8);
     await flutterTts.setVolume(1.0);
     await flutterTts.setPitch(1.0);
+
+    // completion listener
+    flutterTts.setCompletionHandler(() {
+      isSpeaking = false;
+      _processNextTtsMessage();
+    });
+
+    // error listener
+    flutterTts.setErrorHandler((msg) {
+      print("TTS Error: $msg");
+      isSpeaking = false;
+      _processNextTtsMessage(); // Try the next message
+    });
+
+    // queue processor
+    ttsQueueTimer = Timer.periodic(Duration(milliseconds: 100), (timer) {
+      if (!isSpeaking && ttsQueue.isNotEmpty) {
+        _processNextTtsMessage();
+      }
+    });
+  }
+
+  void _processNextTtsMessage() {
+    if (ttsQueue.isEmpty || isSpeaking) return;
+
+    String message = ttsQueue.removeFirst();
+    _speakMessageDirectly(message);
+  }
+
+  Future<void> _speakMessageDirectly(String message) async {
+    try {
+      isSpeaking = true;
+      await flutterTts.speak(message);
+    } catch (e) {
+      print("TTS Direct Speak Error: ${e.toString()}");
+      isSpeaking = false;
+      _processNextTtsMessage();
+      _processNextTtsMessage();
+    }
   }
 
   Widget _buildSensorIndicator(String label, int value) {
@@ -312,10 +357,27 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
         isBtConnected = true;
       });
 
+      // Buffer for handling fragmented messages
+      StringBuffer dataBuffer = StringBuffer();
+
       // Listen for incoming data from Arduino
       btConnection!.input!.listen((Uint8List data) {
-        String dataString = ascii.decode(data).trim();
-        _processReceivedData(dataString);
+        String incomingData = ascii.decode(data).trim();
+        // Add to buffer
+        dataBuffer.write(incomingData);
+        // Process complete messages (assuming messages end with newline or similar delimiter)
+        if (incomingData.contains('\n') || incomingData.contains('\r')) {
+          String completeData = dataBuffer.toString().trim();
+          // Clear buffer after processing
+          dataBuffer.clear();
+
+          // Process each message if multiple are received
+          for (String message in completeData.split(RegExp(r'[\r\n]+'))) {
+            if (message.isNotEmpty) {
+              _processReceivedData(message);
+            }
+          }
+        }
       }).onDone(() {
         setState(() {
           isBtConnected = false;
@@ -344,35 +406,58 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _speakMessage(String message) async {
-    await flutterTts.speak(message);
-  }
+    // Check if this is a priority message
+    if (priorityMessages.contains(receivedData)) {
+      // For priority messages, stop current speech and speak immediately
+      await flutterTts.stop();
+      ttsQueue.clear(); // Clear queue for urgent messages
+      ttsQueue.addFirst(message); // Add to front of queue
+    } else {
+      // For regular messages, add to queue
+      ttsQueue.add(message);
+    }
 
-  void _processReceivedData(String data) {
-    setState(() {
-      receivedData = data;
-    });
-
-    if (receivedData == "TB"){
-      _speakMessage("Turn Back");
-    }else if (receivedData == "OAS"){
-      _speakMessage("Obstacle Ahead, Stop");
-    }else if (receivedData == "SRTN"){
-      _speakMessage("Sharp Right Turn Needed");
-    }else if (receivedData == "TR"){
-      _speakMessage("Turn Right");
-    }else if (receivedData == "OB"){
-      _speakMessage("Obstacle on Both Sides, Proceed with Caution");
-    }else if (receivedData == "SLRN"){
-      _speakMessage("Sharp Left Turn Needed");
-    }else if (receivedData == "TL"){
-      _speakMessage("Turn Left");
-    }else if (receivedData == "PC"){
-      _speakMessage("Path Clear Proceed");
-    }else if (receivedData == "NP"){
-      _speakMessage("Caution! Narrow Passage");
+    // If not speaking, process immediately
+    if (!isSpeaking) {
+      _processNextTtsMessage();
     }
   }
+  void _processReceivedData(String data) {
+    // Trim the data to remove any whitespace
+    final String cleanData = data.trim();
 
+    // Log the received data for debugging
+    print("Received data: '$cleanData'");
+    setState(() {
+      receivedData = cleanData;
+    });
+
+    // Map of codes to their corresponding messages
+    final Map<String, String> messageMap = {
+      "TB": "Turn Back",
+      "OAS": "Obstacle Ahead Stop",
+      "SRTN": "Sharp Right Turn Needed",
+      "TR": "Turn Right",
+      "OB": "Obstacle on Both Sides",
+      "SLTN": "Sharp Left Turn Needed",
+      "TL": "Turn Left",
+      "PC": "Path Clear Proceed",
+      "NP": "Caution! Narrow Passage",
+      "CD": "Caution! Obstacle nearby",
+    };
+
+    if (messageMap.containsKey(cleanData)) {
+      _speakMessage(messageMap[cleanData]!);
+
+      // Update lastAlert for UI display
+      setState(() {
+        lastAlert = messageMap[cleanData]!;
+      });
+    } else {
+      // If we receive an unknown code, log it for debugging
+      print("Unknown message code received: '$cleanData'");
+    }
+  }
   void _cleanupResources() {
     stopStreaming();
     cameraController?.dispose();
@@ -391,12 +476,6 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       serviceEnabled = await location.requestService();
       if (!serviceEnabled) return;
     }
-    /*
-    PermissionStatus permissionStatus = await location.hasPermission();
-    if (permissionStatus == PermissionStatus.denied) {
-      permissionStatus = await location.requestPermission();
-      if (permissionStatus != PermissionStatus.granted) return;
-    }*/
 
     // Configure location service for better accuracy
     await location.changeSettings(
@@ -426,7 +505,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
     cameraController = CameraController(
       selectedCamera,
-      ResolutionPreset.low, // Lower resolution for better streaming performance
+      ResolutionPreset.high, // Lower resolution for better streaming performance
       enableAudio: false,
       imageFormatGroup: ImageFormatGroup.yuv420, // Optimized format for processing
     );
@@ -750,16 +829,152 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
     });
   }
 
+
+Future<Uint8List> _convertYUV420toJPEG(CameraImage image, int quality, int targetWidth) async {
+    try {
+      final int width = image.width;
+      final int height = image.height;
+
+      // Maintain aspect ratio
+      final int targetHeight = (targetWidth * height / width).round();
+
+      // Create an image buffer with proper color space
+      final img.Image imgLib = img.Image(width: targetWidth, height: targetHeight);
+
+      // Get plane data
+      final yPlane = image.planes[0];
+      final uPlane = image.planes[1];
+      final vPlane = image.planes[2];
+
+      final int yRowStride = yPlane.bytesPerRow;
+      final int uvRowStride = uPlane.bytesPerRow;
+      final int uvPixelStride = uPlane.bytesPerPixel!;
+
+      // YUV to RGB conversion - implemented directly without external functions
+      for (int y = 0; y < targetHeight; y++) {
+        final sourceY = (y * height / targetHeight).floor();
+
+        for (int x = 0; x < targetWidth; x++) {
+          final sourceX = (x * width / targetWidth).floor();
+
+          final int yIndex = sourceY * yRowStride + sourceX;
+
+          // Calculate UV indices based on YUV420 format (half resolution for U and V)
+          final int uvY = sourceY ~/ 2;
+          final int uvX = sourceX ~/ 2;
+          final int uvIndex = uvY * uvRowStride + uvX * uvPixelStride;
+
+          // Check bounds to prevent index errors
+          if (yIndex >= yPlane.bytes.length ||
+              uvIndex >= uPlane.bytes.length ||
+              uvIndex >= vPlane.bytes.length) {
+            continue;
+          }
+
+          // Get YUV values with proper unsigned byte handling
+          final int yValue = yPlane.bytes[yIndex] & 0xFF;
+          final int uValue = uPlane.bytes[uvIndex] & 0xFF;
+          final int vValue = vPlane.bytes[uvIndex] & 0xFF;
+
+          // Standard YUV to RGB conversion formula
+          // ITU-R recommendation BT.601 (formerly CCIR 601) standard
+          int r = (yValue + 1.402 * (vValue - 128)).round();
+          int g = (yValue - 0.344136 * (uValue - 128) - 0.714136 * (vValue - 128)).round();
+          int b = (yValue + 1.772 * (uValue - 128)).round();
+
+          // Clamp to valid RGB range
+          r = r.clamp(0, 255);
+          g = g.clamp(0, 255);
+          b = b.clamp(0, 255);
+
+          imgLib.setPixelRgb(x, y, r, g, b);
+        }
+      }
+
+      // Apply correct rotation based on camera orientation
+      final int sensorOrientation = widget.cameras[0].sensorOrientation;
+      img.Image rotatedImage;
+      switch (sensorOrientation) {
+        case 90:
+          rotatedImage = img.copyRotate(imgLib, angle: 90);
+          break;
+        case 180:
+          rotatedImage = img.copyRotate(imgLib, angle: 180);
+          break;
+        case 270:
+          rotatedImage = img.copyRotate(imgLib, angle: 270);
+          break;
+        default:
+          rotatedImage = imgLib; // No rotation needed
+      }
+
+      // Ensure proper encoding with color preservation
+      final List<int> jpegBytes = img.encodeJpg(rotatedImage, quality: quality);
+      return Uint8List.fromList(jpegBytes);
+    } catch (e) {
+      print('Error in YUV conversion: $e');
+
+      // Create a colored fallback image to verify color pipeline
+      final img.Image imgLib = img.Image(width: 160, height: 120);
+      // Add a colored pattern to verify color is working
+      for (int y = 0; y < imgLib.height; y++) {
+        for (int x = 0; x < imgLib.width; x++) {
+          if ((x ~/ 20 + y ~/ 20) % 2 == 0) {
+            imgLib.setPixelRgba(x, y, 255, 0, 0, 255); // Red
+          } else {
+            imgLib.setPixelRgba(x, y, 0, 0, 255, 255); // Blue
+          }
+        }
+      }
+      final List<int> jpegBytes = img.encodeJpg(imgLib, quality: quality);
+      return Uint8List.fromList(jpegBytes);
+    }
+  }
+
+// For examining image format to debug color issues
+  void _printImageFormatDetails(CameraImage image) {
+    print('\n------ Camera Image Format Details ------');
+    print('Format Group: ${image.format.group}');
+    print('Format Raw: ${image.format.raw}');
+    print('Width: ${image.width}, Height: ${image.height}');
+    print('Planes count: ${image.planes.length}');
+
+    for (int i = 0; i < image.planes.length; i++) {
+      print('Plane $i:');
+      print('  Bytes per row: ${image.planes[i].bytesPerRow}');
+      print('  Bytes per pixel: ${image.planes[i].bytesPerPixel}');
+      print('  Height: ${image.planes[i].height}');
+      print('  Width: ${image.planes[i].width}');
+      print('  Bytes length: ${image.planes[i].bytes.length}');
+      if (image.planes[i].bytes.length > 0) {
+        print('  First few bytes: ${image.planes[i].bytes.sublist(0, math.min(10, image.planes[i].bytes.length))}');
+      }
+    }
+    print('----------------------------------------\n');
+  }
+
+
+// Modified image processing function to try both methods
   Future<void> _processAndSendCameraImage(CameraImage image) async {
     try {
-      // Process image based on connection quality
+      // Dynamic quality adjustment
       final int qualityAdjusted = (JPEG_QUALITY * connectionQuality).round();
       final int widthAdjusted = (TARGET_WIDTH * connectionQuality).round();
 
-      // Convert YUV image to JPEG with optimization
-      final bytes = await _convertYUV420toJPEG(image,
-          qualityAdjusted > 20 ? qualityAdjusted : 20,
-          widthAdjusted > 160 ? widthAdjusted : 160);
+      Uint8List bytes;
+
+      // Try using the plugin method first
+      try {
+        bytes = await _convertYUV420toJPEG(image,
+            qualityAdjusted > 20 ? qualityAdjusted : 20,
+            widthAdjusted > 160 ? widthAdjusted : 160);
+      } catch (e) {
+        print('Plugin conversion failed, falling back to manual: $e');
+        // Fall back to the fixed manual conversion
+        bytes = await _convertYUV420toJPEG(image,
+            qualityAdjusted > 20 ? qualityAdjusted : 20,
+            widthAdjusted > 160 ? widthAdjusted : 160);
+      }
 
       // Send to all connected clients
       bool successfullySent = false;
@@ -783,96 +998,128 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       }
     } catch (e) {
       print('Error processing camera image: $e');
+    } finally {
+      isProcessingFrame = false;
     }
   }
+// Isolate function for better performance
+  Uint8List _processImageInIsolate(Map<String, dynamic> params) {
+    final int width = params['width'];
+    final int height = params['height'];
+    final int targetWidth = params['targetWidth'];
+    final int targetHeight = params['targetHeight'];
+    final int quality = params['quality'];
+    final Uint8List yPlane = params['yPlane'];
+    final Uint8List uPlane = params['uPlane'];
+    final Uint8List vPlane = params['vPlane'];
+    final int yRowStride = params['yRowStride'];
+    final int uvRowStride = params['uvRowStride'];
+    final int uvPixelStride = params['uvPixelStride'];
+    final int orientation = params['orientation'];
 
-  // Optimized YUV to JPEG conversion using compute isolate
-  Future<Uint8List> _convertYUV420toJPEG(CameraImage image, int quality, int targetWidth) async {
-    try {
-      final int width = image.width;
-      final int height = image.height;
+    // Create image with the target size directly to avoid multiple resizes
+    final img.Image imgLib = img.Image(width: targetWidth, height: targetHeight);
 
-      // Maintain aspect ratio
-      final int targetHeight = (targetWidth * height / width).round();
+    // Improved YUV to RGB conversion - using integer math where possible
+    // Look-up tables for faster conversion
+    final List<int> yLookup = List<int>.generate(256, (i) => i);
+    final List<int> rVLookup = List<int>.generate(256, (i) => (1.402 * (i - 128)).round());
+    final List<int> gULookup = List<int>.generate(256, (i) => (0.344136 * (i - 128)).round());
+    final List<int> gVLookup = List<int>.generate(256, (i) => (0.714136 * (i - 128)).round());
+    final List<int> bULookup = List<int>.generate(256, (i) => (1.772 * (i - 128)).round());
 
-      // Create an efficient buffer for conversion
-      final img.Image imgLib = img.Image(width: targetWidth, height: targetHeight);
+    // Better sampling algorithm - bilinear interpolation for higher quality
+    for (int y = 0; y < targetHeight; y++) {
+      final double sourceYF = y * height / targetHeight;
+      final int sourceY1 = sourceYF.floor();
+      final int sourceY2 = math.min(sourceY1 + 1, height - 1);
+      final double yWeight = sourceYF - sourceY1;
 
-      // Process in lower resolution for performance
-      final int pixelSkip = (width / targetWidth).ceil();
+      for (int x = 0; x < targetWidth; x++) {
+        final double sourceXF = x * width / targetWidth;
+        final int sourceX1 = sourceXF.floor();
+        final int sourceX2 = math.min(sourceX1 + 1, width - 1);
+        final double xWeight = sourceXF - sourceX1;
 
-      // Get plane data
-      final yPlane = image.planes[0];
-      final uPlane = image.planes[1];
-      final vPlane = image.planes[2];
+        // Bilinear interpolation for Y values
+        final int yIndex1 = sourceY1 * yRowStride + sourceX1;
+        final int yIndex2 = sourceY1 * yRowStride + sourceX2;
+        final int yIndex3 = sourceY2 * yRowStride + sourceX1;
+        final int yIndex4 = sourceY2 * yRowStride + sourceX2;
 
-      final int yRowStride = yPlane.bytesPerRow;
-      final int uvRowStride = uPlane.bytesPerRow;
-      final int uvPixelStride = uPlane.bytesPerPixel!;
-
-      // Optimized conversion loop - stride based with pixel skipping
-      for (int y = 0; y < targetHeight; y++) {
-        final sourceY = (y * height / targetHeight).floor();
-
-        for (int x = 0; x < targetWidth; x++) {
-          final sourceX = (x * width / targetWidth).floor();
-
-          final int yIndex = sourceY * yRowStride + sourceX;
-          final int uvIndex = (sourceY ~/ 2) * uvRowStride + (sourceX ~/ 2) * uvPixelStride;
-
-          // Check bounds to prevent index errors
-          if (yIndex >= yPlane.bytes.length ||
-              uvIndex >= uPlane.bytes.length ||
-              uvIndex >= vPlane.bytes.length) {
-            continue;
-          }
-
-          // YUV to RGB conversion - optimized coefficients
-          final int yValue = yPlane.bytes[yIndex];
-          final int uValue = uPlane.bytes[uvIndex];
-          final int vValue = vPlane.bytes[uvIndex];
-
-          // Fast YUV to RGB conversion
-          int r = (yValue + 1.402 * (vValue - 128)).round().clamp(0, 255);
-          int g = (yValue - 0.344136 * (uValue - 128) - 0.714136 * (vValue - 128)).round().clamp(0, 255);
-          int b = (yValue + 1.772 * (uValue - 128)).round().clamp(0, 255);
-
-          imgLib.setPixelRgb(x, y, r, g, b);
+        // Safe bounds checking
+        if (math.max(yIndex1, math.max(yIndex2, math.max(yIndex3, yIndex4))) >= yPlane.length) {
+          continue;
         }
+
+        final int y1 = yPlane[yIndex1] & 0xFF;
+        final int y2 = yPlane[yIndex2] & 0xFF;
+        final int y3 = yPlane[yIndex3] & 0xFF;
+        final int y4 = yPlane[yIndex4] & 0xFF;
+
+        final int yValue = (y1 * (1 - xWeight) * (1 - yWeight) +
+            y2 * xWeight * (1 - yWeight) +
+            y3 * (1 - xWeight) * yWeight +
+            y4 * xWeight * yWeight).round();
+
+        // Get U and V values (subsampled, so divide by 2)
+        final int uvY1 = (sourceY1 ~/ 2);
+        final int uvX1 = (sourceX1 ~/ 2);
+
+        final int uvIndex = uvY1 * uvRowStride + uvX1 * uvPixelStride;
+
+        // Safe bounds checking
+        if (uvIndex >= uPlane.length || uvIndex >= vPlane.length) {
+          continue;
+        }
+
+        final int uValue = uPlane[uvIndex] & 0xFF;
+        final int vValue = vPlane[uvIndex] & 0xFF;
+
+        // Fast YUV to RGB conversion using lookup tables
+        int r = (yValue + rVLookup[vValue]).clamp(0, 255);
+        int g = (yValue - gULookup[uValue] - gVLookup[vValue]).clamp(0, 255);
+        int b = (yValue + bULookup[uValue]).clamp(0, 255);
+
+        imgLib.setPixelRgb(x, y, r, g, b);
       }
-      final int sensorOrientation = widget.cameras[0].sensorOrientation;
-      img.Image rotatedImage;
-      switch (sensorOrientation) {
-        case 90:
-          rotatedImage = img.copyRotate(imgLib, angle: 90);
-          break;
-        case 180:
-          rotatedImage = img.copyRotate(imgLib, angle: 180);
-          break;
-        case 270:
-          rotatedImage = img.copyRotate(imgLib, angle: 270);
-          break;
-        default:
-          rotatedImage = imgLib; // No rotation needed
-      }
-
-      // Resize the image to fixed dimensions
-      final img.Image resizedImage = img.copyResize(rotatedImage, width: 320, height: 240);
-
-      // Encode with reduced quality for better transmission speed
-      final List<int> jpegBytes = img.encodeJpg(imgLib, quality: quality);
-
-      return Uint8List.fromList(jpegBytes);
-    } catch (e) {
-      print('Error in YUV conversion: $e');
-
-      // Fallback method if the primary one fails
-      final img.Image imgLib = img.Image(width: 160, height: 120);
-      final List<int> jpegBytes = img.encodeJpg(imgLib, quality: 40);
-      return Uint8List.fromList(jpegBytes);
     }
+
+    // Handle rotation based on sensor orientation
+    img.Image rotatedImage;
+    switch (orientation) {
+      case 90:
+        rotatedImage = img.copyRotate(imgLib, angle: 90);
+        break;
+      case 180:
+        rotatedImage = img.copyRotate(imgLib, angle: 180);
+        break;
+      case 270:
+        rotatedImage = img.copyRotate(imgLib, angle: 270);
+        break;
+      default:
+        rotatedImage = imgLib; // No rotation needed
+    }
+
+    // Apply subtle image enhancement for better quality
+    final img.Image enhancedImage = _enhanceImage(rotatedImage);
+
+    // Encode with optimized quality
+    final List<int> jpegBytes = img.encodeJpg(enhancedImage, quality: quality);
+    return Uint8List.fromList(jpegBytes);
   }
 
+// Image enhancement function for better visual quality
+  img.Image _enhanceImage(img.Image image) {
+    // Apply slight contrast enhancement
+    return img.adjustColor(
+      image,
+      contrast: 1.1,
+      saturation: 1.05,
+      // Avoid excessive sharpening which can introduce noise
+      exposure: 1.02,
+    );
+  }
   void connectToServer() async {
     final formKey = GlobalKey<FormState>();
     String serverIp = "192.168.43.1"; // Default hotspot IP
@@ -1118,7 +1365,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text('Navigation Assistant'),
+        title: Text('Sancim App'),
         actions: [
           if (isConnected)
             IconButton(
@@ -1155,15 +1402,23 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       body: Stack(
         children: [
           // Main content
-          Center(
+          Positioned.fill(
             child: isServer
                 ? (isCameraInitialized
-                ? CameraPreview(cameraController!)
-                : CircularProgressIndicator())
+                ? FittedBox(
+                  fit: BoxFit.cover, // Ensures the preview fills the screen
+                  child: SizedBox(
+                    width: MediaQuery.of(context).size.width,
+                    height: MediaQuery.of(context).size.height,
+                    child: CameraPreview(cameraController!),
+                  ),
+                )
+                : Center(child:CircularProgressIndicator()))
                 : (isConnected
                 ? (receivedImageData != null
                 ? Image.memory(
               receivedImageData!,
+              fit: BoxFit.cover,
               gaplessPlayback: true, // Prevent flickering
               key: ValueKey(framesReceived), // Force refresh
             )
@@ -1211,13 +1466,26 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
           if (!isServer && isConnected && remoteLocation != null)
             Positioned(
               left: 10,
-              top: 50,
-              right: 10,
+              top: 10, // Account for status bar
               child: Container(
-                height: 250, // Fixed height for the map
+                // Dynamic width based on screen size (30% of screen width)
+                width: MediaQuery.of(context).size.width * 0.3,
+                // Dynamic height with min/max constraints
+                height: math.min(
+                  MediaQuery.of(context).size.height * 0.25, // 25% of screen height
+                  200, // Maximum height
+                ),
                 decoration: BoxDecoration(
                   color: Colors.black.withOpacity(0.6),
                   borderRadius: BorderRadius.circular(10),
+                  // Add a subtle shadow for better visibility
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black26,
+                      blurRadius: 4,
+                      offset: Offset(0, 2),
+                    ),
+                  ],
                 ),
                 child: ClipRRect(
                   borderRadius: BorderRadius.circular(10),
@@ -1228,7 +1496,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                         remoteLocation!.latitude!,
                         remoteLocation!.longitude!,
                       ),
-                      zoom: 15.0, // Initial zoom level
+                      zoom: 15.0,
+                      maxZoom: 18.0,
+                      minZoom: 10.0,
+                      // Disable interactions if you want a static map display
+                      // interactionOptions: InteractionOptions(
+                      //   flags: InteractiveFlag.none,
+                      // ),
                     ),
                     children: [
                       // OpenStreetMap tiles
@@ -1291,97 +1565,7 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
                 ),
               ),
             ),
-
-          // Location data overlay
-          if (isConnected && remoteLocation != null)
-            Positioned(
-              left: 10,
-              bottom: 90,
-              child: Container(
-                padding: EdgeInsets.all(8),
-                width: MediaQuery.of(context).size.width - 10,
-                decoration: BoxDecoration(
-                  color: Colors.black.withOpacity(0.6),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(
-                      'Remote Location',
-                      style: TextStyle(
-                        color: Colors.white,
-                        fontWeight: FontWeight.bold,
-                      ),
-                    ),
-                    SizedBox(height: 4),
-                    Text(
-                      'Lat: ${remoteLocation!.latitude?.toStringAsFixed(6) ?? "Unknown"}',
-                      style: TextStyle(color: Colors.white),
-                    ),
-                    Text(
-                      'Lng: ${remoteLocation!.longitude?.toStringAsFixed(6) ?? "Unknown"}',
-                      style: TextStyle(color: Colors.white),
-                    ),
-                    Text(
-                      'Accuracy: ${remoteLocation!.accuracy?.toStringAsFixed(2) ?? "Unknown"} m',
-                      style: TextStyle(color: Colors.white),
-                    ),
-                    if (currentLocation != null)
-                      Text(
-                        'Distance: ${_calculateDistance(
-                          currentLocation!.latitude ?? 0,
-                          currentLocation!.longitude ?? 0,
-                          remoteLocation!.latitude ?? 0,
-                          remoteLocation!.longitude ?? 0,
-                        ).toStringAsFixed(0)} m',
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-            ),
-
-          // Streaming statistics
-          if (isServer && isStreaming)
-            Positioned(
-              left: 10,
-              top: 10,
-              child: Container(
-                padding: EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: Colors.black.withOpacity(0.6),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: Text(
-                  'Sending: $framesSent frames',
-                  style: TextStyle(color: Colors.white),
-                ),
-              ),
-            ),
-
-          // Reception statistics
-          if (!isServer && isConnected)
-            Positioned(
-              left: 10,
-              top: 10,
-              child: Container(
-                padding: EdgeInsets.all(8),
-                decoration: BoxDecoration(
-                  color: Colors.black.withOpacity(0.6),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: Text(
-                  'Received: $framesReceived frames',
-                  style: TextStyle(color: Colors.white),
-                ),
-              ),
-            ),
-        ],
+          ],
       ),
       bottomNavigationBar: BottomAppBar(
         color: Colors.blue,
