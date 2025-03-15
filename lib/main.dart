@@ -1,5 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:collection';
+import 'dart:async';
 import 'dart:io';
 import 'dart:math' as math;
 import 'dart:typed_data';
@@ -92,6 +94,13 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   // Text-to-Speech
   FlutterTts flutterTts = FlutterTts();
+  Queue<String> ttsQueue = Queue<String>();
+  bool isSpeaking = false;
+  Timer? ttsQueueTimer;
+
+
+  // Define priority messages that should interrupt current speech
+  Set<String> priorityMessages = {'TB', 'OAS', 'CD'};
 
   // Arduino data
   String receivedData = "";
@@ -146,6 +155,8 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
     _cleanupResources();
+    ttsQueueTimer?.cancel();
+    flutterTts.stop();
     super.dispose();
   }
 
@@ -175,9 +186,48 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
 
   Future<void> _initTextToSpeech() async {
     await flutterTts.setLanguage("en-US");
-    await flutterTts.setSpeechRate(0.5);
+    await flutterTts.setSpeechRate(0.8);
     await flutterTts.setVolume(1.0);
     await flutterTts.setPitch(1.0);
+
+    // completion listener
+    flutterTts.setCompletionHandler(() {
+      isSpeaking = false;
+      _processNextTtsMessage();
+    });
+
+    // error listener
+    flutterTts.setErrorHandler((msg) {
+      print("TTS Error: $msg");
+      isSpeaking = false;
+      _processNextTtsMessage(); // Try the next message
+    });
+
+    // queue processor
+    ttsQueueTimer = Timer.periodic(Duration(milliseconds: 100), (timer) {
+      if (!isSpeaking && ttsQueue.isNotEmpty) {
+        _processNextTtsMessage();
+      }
+    });
+  }
+
+  void _processNextTtsMessage() {
+    if (ttsQueue.isEmpty || isSpeaking) return;
+
+    String message = ttsQueue.removeFirst();
+    _speakMessageDirectly(message);
+  }
+
+  Future<void> _speakMessageDirectly(String message) async {
+    try {
+      isSpeaking = true;
+      await flutterTts.speak(message);
+    } catch (e) {
+      print("TTS Direct Speak Error: ${e.toString()}");
+      isSpeaking = false;
+      _processNextTtsMessage();
+      _processNextTtsMessage();
+    }
   }
 
   Widget _buildSensorIndicator(String label, int value) {
@@ -356,24 +406,22 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
   }
 
   Future<void> _speakMessage(String message) async {
-    try {
-      // Stop any currently speaking message to avoid queue backlog
+    // Check if this is a priority message
+    if (priorityMessages.contains(receivedData)) {
+      // For priority messages, stop current speech and speak immediately
       await flutterTts.stop();
+      ttsQueue.clear(); // Clear queue for urgent messages
+      ttsQueue.addFirst(message); // Add to front of queue
+    } else {
+      // For regular messages, add to queue
+      ttsQueue.add(message);
+    }
 
-      // Set options for better speech clarity
-      await flutterTts.setVolume(1.0);
-      await flutterTts.setSpeechRate(0.5); // Slower rate for better comprehension
-
-      // Queue the message
-      var result = await flutterTts.speak(message);
-
-      // Log the result for debugging
-      print("TTS Result: $result for message: $message");
-    } catch (e) {
-      print("TTS Error: ${e.toString()}");
+    // If not speaking, process immediately
+    if (!isSpeaking) {
+      _processNextTtsMessage();
     }
   }
-
   void _processReceivedData(String data) {
     // Trim the data to remove any whitespace
     final String cleanData = data.trim();
@@ -390,24 +438,26 @@ class _HomePageState extends State<HomePage> with WidgetsBindingObserver {
       "OAS": "Obstacle Ahead Stop",
       "SRTN": "Sharp Right Turn Needed",
       "TR": "Turn Right",
-      "OB": "Obstacle on Both Sides Proceed with Caution",
-      "SLRN": "Sharp Left Turn Needed",
+      "OB": "Obstacle on Both Sides",
+      "SLTN": "Sharp Left Turn Needed",
       "TL": "Turn Left",
       "PC": "Path Clear Proceed",
       "NP": "Caution! Narrow Passage",
-      // Add any other messages that might be coming from the Arduino
+      "CD": "Caution! Obstacle nearby",
     };
+
     if (messageMap.containsKey(cleanData)) {
       _speakMessage(messageMap[cleanData]!);
+
+      // Update lastAlert for UI display
+      setState(() {
+        lastAlert = messageMap[cleanData]!;
+      });
     } else {
       // If we receive an unknown code, log it for debugging
       print("Unknown message code received: '$cleanData'");
-
-      // Optionally speak that an unknown command was received
-      // _speakMessage("Unknown command received");
     }
   }
-
   void _cleanupResources() {
     stopStreaming();
     cameraController?.dispose();
